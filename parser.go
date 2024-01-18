@@ -37,6 +37,7 @@ type parseState struct {
 	msgBuf    []byte
 	msgCopied bool
 	scratch   [MAX_CONTROL_LINE_SIZE]byte
+	bufPool   chan []byte
 }
 
 const (
@@ -401,8 +402,12 @@ func (nc *Conn) parse(buf []byte) error {
 		// new buffer to hold the split message.
 		if nc.ps.ma.size > cap(nc.ps.scratch)-len(nc.ps.argBuf) {
 			lrem := len(buf[nc.ps.as:])
-
-			nc.ps.msgBuf = make([]byte, lrem, nc.ps.ma.size)
+			select {
+			case nc.ps.msgBuf = <-nc.ps.bufPool:
+				nc.ps.msgBuf = extendBuffer(nc.ps.msgBuf, lrem, nc.ps.ma.size)
+			default:
+				nc.ps.msgBuf = make([]byte, lrem, nc.ps.ma.size)
+			}
 			copy(nc.ps.msgBuf, buf[nc.ps.as:])
 			nc.ps.msgCopied = true
 		} else {
@@ -415,6 +420,14 @@ func (nc *Conn) parse(buf []byte) error {
 
 parseErr:
 	return fmt.Errorf("nats: Parse Error [%d]: '%s'", nc.ps.state, buf[i:])
+}
+
+func extendBuffer(buf []byte, size int, capacity int) []byte {
+	requiredCap := capacity - cap(buf)
+	if requiredCap > 0 {
+		buf = append(buf[:cap(buf)], make([]byte, requiredCap)...)
+	}
+	return buf[:size]
 }
 
 // cloneMsgArg is used when the split buffer scenario has the pubArg in the existing read buffer, but

@@ -2947,7 +2947,9 @@ func (nc *Conn) readLoop() {
 	// Create a parseState if needed.
 	nc.mu.Lock()
 	if nc.ps == nil {
-		nc.ps = &parseState{}
+		nc.ps = &parseState{
+			bufPool: make(chan []byte, DefaultMaxChanLen),
+		}
 	}
 	conn := nc.conn
 	br := nc.br
@@ -4160,6 +4162,14 @@ func (nc *Conn) QueueSubscribeSync(subj, queue string) (*Subscription, error) {
 // Note: This is the same than ChanQueueSubscribe.
 func (nc *Conn) QueueSubscribeSyncWithChan(subj, queue string, ch chan *Msg) (*Subscription, error) {
 	return nc.subscribe(subj, queue, nil, ch, false, nil)
+}
+
+func (nc *Conn) ReleaseBuffer(buf []byte) {
+	select {
+	case nc.ps.bufPool <- buf:
+	default:
+		// Allow the buffer to escape
+	}
 }
 
 // badSubject will do quick test on whether a subject is acceptable.
