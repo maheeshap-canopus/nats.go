@@ -15,6 +15,7 @@ package nats
 
 import (
 	"fmt"
+	"sync/atomic"
 )
 
 type msgArg struct {
@@ -37,7 +38,6 @@ type parseState struct {
 	msgBuf    []byte
 	msgCopied bool
 	scratch   [MAX_CONTROL_LINE_SIZE]byte
-	bufPool   chan []byte
 }
 
 const (
@@ -403,9 +403,11 @@ func (nc *Conn) parse(buf []byte) error {
 		if nc.ps.ma.size > cap(nc.ps.scratch)-len(nc.ps.argBuf) {
 			lrem := len(buf[nc.ps.as:])
 			select {
-			case nc.ps.msgBuf = <-nc.ps.bufPool:
+			case nc.ps.msgBuf = <-nc.bufPool:
+				atomic.AddUint64(&nc.ReusedBufs, 1)
 				nc.ps.msgBuf = extendBuffer(nc.ps.msgBuf, lrem, nc.ps.ma.size)
 			default:
+				atomic.AddUint64(&nc.AllocBufs, 1)
 				nc.ps.msgBuf = make([]byte, lrem, nc.ps.ma.size)
 			}
 			copy(nc.ps.msgBuf, buf[nc.ps.as:])

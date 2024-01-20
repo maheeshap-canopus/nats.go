@@ -498,6 +498,9 @@ type Options struct {
 
 	// SkipHostLookup skips the DNS lookup for the server hostname.
 	SkipHostLookup bool
+
+	// BufferPoolSize sets the size of the pool used for recycling payload slices
+	BufferPoolSize int
 }
 
 const (
@@ -550,6 +553,7 @@ type Conn struct {
 	ach           *asyncCallbacksHandler
 	pongs         []chan struct{}
 	scratch       [scratchSize]byte
+	bufPool       chan []byte
 	status        Status
 	statListeners map[Status][]chan Status
 	initc         bool // true if the connection is performing the initial connect
@@ -739,11 +743,16 @@ type barrierInfo struct {
 // Tracks various stats received and sent on this connection,
 // including counts for messages and bytes.
 type Statistics struct {
-	InMsgs     uint64
-	OutMsgs    uint64
-	InBytes    uint64
-	OutBytes   uint64
-	Reconnects uint64
+	InMsgs       uint64
+	OutMsgs      uint64
+	InBytes      uint64
+	OutBytes     uint64
+	Reconnects   uint64
+	AllocBufs    uint64
+	FreedBufs    uint64
+	ReusedBufs   uint64
+	ReleasedBufs uint64
+	BufferFull   float64
 }
 
 // Tracks individual backend servers.
@@ -1322,6 +1331,14 @@ func SkipHostLookup() Option {
 	}
 }
 
+// WithBufferPool is an Option to use a buffer pool with size elements for recycling message payload slices
+func WithBufferPool(size int) Option {
+	return func(o *Options) error {
+		o.BufferPoolSize = size
+		return nil
+	}
+}
+
 // TLSHandshakeFirst is an Option to perform the TLS handshake first, that is
 // before receiving the INFO protocol. This requires the server to also be
 // configured with such option, otherwise the connection will fail.
@@ -1516,6 +1533,10 @@ func (o Options) Connect() (*Conn, error) {
 	// Set a default error handler that will print to stderr.
 	if nc.Opts.AsyncErrorCB == nil {
 		nc.Opts.AsyncErrorCB = defaultErrHandler
+	}
+
+	if nc.Opts.BufferPoolSize != 0 {
+		nc.bufPool = make(chan []byte, nc.Opts.BufferPoolSize)
 	}
 
 	// Create reader/writer
@@ -2947,9 +2968,7 @@ func (nc *Conn) readLoop() {
 	// Create a parseState if needed.
 	nc.mu.Lock()
 	if nc.ps == nil {
-		nc.ps = &parseState{
-			bufPool: make(chan []byte, DefaultMaxChanLen),
-		}
+		nc.ps = &parseState{}
 	}
 	conn := nc.conn
 	br := nc.br
@@ -3113,7 +3132,14 @@ func (nc *Conn) processMsg(data []byte) {
 	// FIXME(dlc): Need to copy, should/can do COW?
 	var msgPayload = data
 	if !nc.ps.msgCopied {
-		msgPayload = make([]byte, len(data))
+		select {
+		case msgPayload = <-nc.bufPool:
+			atomic.AddUint64(&nc.ReusedBufs, 1)
+			msgPayload = extendBuffer(msgPayload, len(data), len(data))
+		default:
+			atomic.AddUint64(&nc.AllocBufs, 1)
+			msgPayload = make([]byte, len(data))
+		}
 		copy(msgPayload, data)
 	}
 
@@ -4166,9 +4192,11 @@ func (nc *Conn) QueueSubscribeSyncWithChan(subj, queue string, ch chan *Msg) (*S
 
 func (nc *Conn) ReleaseBuffer(buf []byte) {
 	select {
-	case nc.ps.bufPool <- buf:
+	case nc.bufPool <- buf:
+		atomic.AddUint64(&nc.ReleasedBufs, 1)
 	default:
-		// Allow the buffer to escape
+		atomic.AddUint64(&nc.FreedBufs, 1)
+		// Allow the buffer to be collected by GC
 	}
 }
 
@@ -5392,12 +5420,21 @@ func (nc *Conn) Stats() Statistics {
 	// Stats are updated either under connection's mu or with atomic operations
 	// for inbound stats in processMsg().
 	nc.mu.Lock()
+	var bufferFull float64
+	if nc.bufPool != nil {
+		bufferFull = float64(len(nc.bufPool)) / float64(cap(nc.bufPool))
+	}
 	stats := Statistics{
-		InMsgs:     atomic.LoadUint64(&nc.InMsgs),
-		InBytes:    atomic.LoadUint64(&nc.InBytes),
-		OutMsgs:    nc.OutMsgs,
-		OutBytes:   nc.OutBytes,
-		Reconnects: nc.Reconnects,
+		InMsgs:       atomic.LoadUint64(&nc.InMsgs),
+		InBytes:      atomic.LoadUint64(&nc.InBytes),
+		OutMsgs:      nc.OutMsgs,
+		OutBytes:     nc.OutBytes,
+		Reconnects:   nc.Reconnects,
+		AllocBufs:    atomic.LoadUint64(&nc.AllocBufs),
+		FreedBufs:    atomic.LoadUint64(&nc.FreedBufs),
+		ReusedBufs:   atomic.LoadUint64(&nc.ReusedBufs),
+		ReleasedBufs: atomic.LoadUint64(&nc.ReleasedBufs),
+		BufferFull:   bufferFull,
 	}
 	nc.mu.Unlock()
 	return stats
